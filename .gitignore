@@ -1,0 +1,12 @@
+node_modules/
+dist/
+.native/
+.DS_Store
+*.log
+test-results/
+.qa/
+
+.playwright-cli/
+
+# Private, local user attachments are bundled locally, never committed as source.
+public/local-floorplans/
