@@ -46,14 +46,7 @@ elif [ "$health_code" -eq 2 ]; then
   fail "Another service is using port $PORT. Close it or choose a different PORT."
 fi
 
-if [ ! -d node_modules ]; then
-  echo "Installing Fieldnote dependencies…"
-  if [ -f package-lock.json ]; then
-    npm ci || fail "Dependency installation failed. Check your internet connection and try again."
-  else
-    npm install || fail "Dependency installation failed. Check your internet connection and try again."
-  fi
-fi
+node scripts/ensure-dependencies.mjs || fail "Dependency setup failed. The error is printed above."
 
 echo "Building Fieldnote and its native Wi-Fi reader…"
 npm run build || fail "The build failed. The error is printed above."

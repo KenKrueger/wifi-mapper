@@ -31,11 +31,9 @@ import {
   canCombineReadings,
   createSurvey,
   exportCSV,
-  interpolateAt,
   isFreshReading,
   quality,
   summarizeReadings,
-  validateSurvey,
   type Point,
   type Reading,
   type Survey,
@@ -43,14 +41,14 @@ import {
 import {
   activateSurvey,
   addSurvey,
-  loadLibrary,
   mergeFloorTemplates,
-  saveLibrary,
   serializeLibrary,
   updateActiveSurvey,
-  validateLibrary,
   type SurveyLibrary,
 } from "./lib/library";
+import { createLibraryPersistence, LibraryConflictError } from "./lib/persistence";
+import { readSurveyBackup } from "./lib/backup";
+import { createHeatmapSampler, heatmapKey } from "./lib/heatmap";
 import { HOME_FLOOR_IDS, loadHomeFloors } from "./lib/floorplans";
 
 type Mode = "measure" | "walls" | "router";
@@ -72,14 +70,14 @@ function download(content: Blob | string, filename: string) {
   if (typeof content !== "string")
     setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
+const stops: [number, [number, number, number]][] = [
+  [-95, [210, 85, 64]],
+  [-80, [225, 126, 66]],
+  [-70, [224, 183, 77]],
+  [-60, [149, 180, 97]],
+  [-45, [51, 137, 107]],
+];
 function rgbFor(rssi: number): [number, number, number] {
-  const stops: [number, [number, number, number]][] = [
-    [-95, [210, 85, 64]],
-    [-80, [225, 126, 66]],
-    [-70, [224, 183, 77]],
-    [-60, [149, 180, 97]],
-    [-45, [51, 137, 107]],
-  ];
   for (let i = 1; i < stops.length; i++) {
     if (rssi <= stops[i][0]) {
       const a = stops[i - 1],
@@ -116,16 +114,15 @@ function paintHeatmap(
   canvas.height = h;
   const ctx = canvas.getContext("2d")!;
   const img = ctx.createImageData(w, h);
+  const sample = createHeatmapSampler(
+    survey.measurements,
+    survey.width,
+    survey.height,
+    radius,
+  );
   for (let y = 0; y < h; y++)
     for (let x = 0; x < w; x++) {
-      const value = interpolateAt(
-        x / (w - 1),
-        y / (h - 1),
-        survey.measurements,
-        survey.width,
-        survey.height,
-        radius,
-      );
+      const value = sample(x / (w - 1), y / (h - 1));
       if (!value) continue;
       const index = (y * w + x) * 4;
       const rgb = rgbFor(value.rssi);
@@ -192,8 +189,16 @@ function Sparkline({ readings }: { readings: Reading[] }) {
 }
 
 export default function App() {
+  const [persistence] = useState(() =>
+    createLibraryPersistence(
+      localStorage,
+      navigator.locks
+        ? (action) => navigator.locks.request("fieldnote-library-write", action)
+        : undefined,
+    ),
+  );
   const [library, setLibrary] = useState<SurveyLibrary>(() =>
-    loadLibrary(localStorage),
+    persistence.initial,
   );
   const libraryRef = useRef(library);
   libraryRef.current = library;
@@ -228,18 +233,21 @@ export default function App() {
   const [settings, setSettings] = useState(false);
   const [exportOpen, setExportOpen] = useState(false);
   const [newSurveyOpen, setNewSurveyOpen] = useState(false);
-  const [saved, setSaved] = useState(true);
-  const [dirty, setDirty] = useState(false);
+  const [savedLibrary, setSavedLibrary] = useState(library);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const [saveConflict, setSaveConflict] = useState(false);
+  const dirty = library !== savedLibrary;
+  const saved = !dirty && saveError === null;
   const [imageBusy, setImageBusy] = useState(false);
   const mapRef = useRef<SVGSVGElement>(null);
   const [mapScale, setMapScale] = useState(1);
   const heatRef = useRef<HTMLCanvasElement>(null);
+  const paintedHeatKey = useRef<string | null>(null);
   const floorInput = useRef<HTMLInputElement>(null);
   const importInput = useRef<HTMLInputElement>(null);
 
   const notify = (text: string, error = false) => setNotice({ text, error });
   function change(update: (old: Survey) => Survey) {
-    setDirty(true);
     setLibrary((state) =>
       updateActiveSurvey(state, (old) => ({
         ...update(old),
@@ -256,13 +264,65 @@ export default function App() {
   }, [survey]);
   useEffect(() => {
     if (!dirty) return;
+    let current = true;
+    const isCurrent = () => current && libraryRef.current === library;
+    setSaveError(null);
+    void persistence.save(library, isCurrent)
+      .then((committed) => {
+        if (!isCurrent() || !committed) return;
+        setSavedLibrary(library);
+        setSaveConflict(false);
+      })
+      .catch((error: unknown) => {
+        if (!isCurrent()) return;
+        setSaveConflict(error instanceof LibraryConflictError);
+        setSaveError(
+          error instanceof DOMException && error.name === "QuotaExceededError"
+            ? "Browser storage is full. Export a backup to keep all your changes."
+            : error instanceof Error
+              ? error.message
+              : "Could not save. Export a backup to keep your changes.",
+        );
+      });
+    return () => {
+      current = false;
+    };
+  }, [library, dirty, persistence]);
+  useEffect(() => {
+    if (!dirty) return;
+    const warn = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", warn);
+    return () => window.removeEventListener("beforeunload", warn);
+  }, [dirty]);
+
+  function reloadSavedFloors() {
+    if (captureRef.current || imageBusy) return;
+    if (!window.confirm(
+      "Load the saved collection and discard this tab's unsaved changes? Export a backup first if you want to keep them.",
+    )) return;
     try {
-      saveLibrary(localStorage, library);
-      setSaved(true);
+      const next = persistence.reload();
+      libraryRef.current = next;
+      setLibrary(next);
+      setSavedLibrary(next);
+      setSaveError(null);
+      setSaveConflict(false);
+      setSelected(null);
+      setWallStart(null);
+      setPointer(null);
+      setSettings(false);
+      setNewSurveyOpen(false);
+      notify("Loaded the latest saved floors.");
     } catch {
-      setSaved(false);
+      notify(
+        "Could not read the saved collection. This tab's changes are still available to export.",
+        true,
+      );
     }
-  }, [library, dirty]);
+  }
   useEffect(() => {
     if (
       HOME_FLOOR_IDS.every((id) =>
@@ -277,7 +337,6 @@ export default function App() {
         setLibrary(
           mergeFloorTemplates(libraryRef.current, floors, !hadSavedSurvey),
         );
-        setDirty(true);
       })
       .catch((error) => {
         if (!cancelled)
@@ -310,7 +369,6 @@ export default function App() {
         name: `${template.name} · revised`,
       };
       setLibrary(addSurvey(libraryRef.current, next));
-      setDirty(true);
       setSelected(null);
       setWallStart(null);
       setPointer(null);
@@ -329,7 +387,6 @@ export default function App() {
   function switchFloor(id: string) {
     if (captureRef.current || imageBusy) return;
     setLibrary((old) => activateSurvey(old, id));
-    setDirty(true);
     setSelected(null);
     setWallStart(null);
     setPointer(null);
@@ -461,8 +518,12 @@ export default function App() {
     return () => window.removeEventListener("keydown", key);
   }, []);
   useEffect(() => {
-    if (heatRef.current) paintHeatmap(heatRef.current, survey, radius);
-  }, [survey, radius]);
+    if (!heatmap || !heatRef.current) return;
+    const key = heatmapKey(survey, radius);
+    if (key === paintedHeatKey.current) return;
+    paintHeatmap(heatRef.current, survey, radius);
+    paintedHeatKey.current = key;
+  }, [survey, radius, heatmap]);
   useEffect(() => {
     const observer = new ResizeObserver(([entry]) => {
       if (entry.contentRect.width > 0)
@@ -621,7 +682,6 @@ export default function App() {
       const data = canvas.toDataURL("image/webp", 0.82);
       if (data.length > 3_000_000)
         throw Error("This image is too detailed. Try a smaller floor plan.");
-      setDirty(true);
       setLibrary((state) => ({
         ...state,
         surveys: state.surveys.map((old) =>
@@ -670,18 +730,21 @@ export default function App() {
   }
   async function importSurvey(file: File) {
     try {
-      if (file.size > 8_000_000) throw Error("Survey file is too large.");
-      const data = JSON.parse(await file.text());
-      const imported = data.version === 2 ? validateLibrary(data) : null;
-      const loaded = imported ? null : validateSurvey(data);
+      const data = await readSurveyBackup(file);
+      const imported = data.version === 2 ? data : null;
+      const loaded = data.version === 1 ? data : null;
       stopCapture();
       if (imported) {
         if (
           !window.confirm(
-            "Restore all floors from this backup? This replaces the current floor collection.",
+            "Restore all floors from this backup? This replaces the current floor collection. If the saved data is unreadable, the original will be offered as a download first.",
           )
         )
           return;
+        persistence.authorizeRestore((raw) => download(
+          new Blob([raw], { type: "application/json" }),
+          "fieldnote-unreadable-backup.json",
+        ));
         setLibrary(imported);
       } else if (loaded) {
         const existing = libraryRef.current.surveys.find(
@@ -696,7 +759,6 @@ export default function App() {
           return;
         setLibrary(addSurvey(libraryRef.current, loaded));
       }
-      setDirty(true);
       setSelected(null);
       setWallStart(null);
       setMode("measure");
@@ -713,10 +775,16 @@ export default function App() {
   async function exportMap() {
     try {
       const heatSnapshot = document.createElement("canvas");
-      if (heatRef.current) {
+      if (
+        heatmap && heatRef.current &&
+        paintedHeatKey.current === heatmapKey(survey, radius)
+      ) {
         heatSnapshot.width = heatRef.current.width;
         heatSnapshot.height = heatRef.current.height;
         heatSnapshot.getContext("2d")!.drawImage(heatRef.current, 0, 0);
+      } else if (heatmap) {
+        // Export may run before the visible canvas effect has painted this state.
+        paintHeatmap(heatSnapshot, survey, radius);
       }
       const c = document.createElement("canvas");
       const mapWidth = Math.min(1440, Math.round(3500 * mapAspect));
@@ -1076,15 +1144,32 @@ export default function App() {
                 A few good field tips <span>↗</span>
               </button>
             </section>
-            <div className={`save-status ${saved ? "" : "save-error"}`}>
+            <div className={`save-status ${saveError ? "save-error" : ""}`}>
               <span>
                 {saved ? <Check size={13} /> : <Activity size={13} />}
               </span>
               {saved
                 ? "Saved in this browser"
-                : "Storage full — export a backup"}
+                : saveError ? "Not saved — export a backup" : "Saving…"}
               <span className="save-dot">·</span>No cloud
             </div>
+            {saveError && (
+              <div className="save-recovery" role="alert">
+                <p>{saveError}</p>
+                <button className="button quiet" onClick={exportAllFloors}>
+                  Export this tab
+                </button>
+                {saveConflict && (
+                  <button
+                    className="button quiet"
+                    onClick={reloadSavedFloors}
+                    disabled={!!capture || imageBusy}
+                  >
+                    Load saved floors
+                  </button>
+                )}
+              </div>
+            )}
           </aside>
 
           <div className="map-column">
@@ -1853,7 +1938,6 @@ export default function App() {
                 updatedAt: new Date().toISOString(),
               };
               setLibrary((old) => addSurvey(old, next));
-              setDirty(true);
               setSelected(null);
               setWallStart(null);
               setNewSurveyOpen(false);
@@ -1882,7 +1966,6 @@ export default function App() {
             disabled={library.surveys.length >= 40 || imageBusy}
             onClick={() => {
               setLibrary((old) => addSurvey(old, createSurvey()));
-              setDirty(true);
               setSelected(null);
               setWallStart(null);
               setNewSurveyOpen(false);

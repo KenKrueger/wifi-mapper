@@ -581,6 +581,22 @@ h1 {
 .save-error {
   color: #b46545;
 }
+.save-recovery {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  font-size: 11px;
+  line-height: 1.6;
+  color: #8a4d32;
+}
+.save-recovery p {
+  flex-basis: 100%;
+  margin: 0;
+}
+.save-recovery .button {
+  flex: 1 1 120px;
+}
 .map-column {
   min-width: 0;
 }

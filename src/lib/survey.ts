@@ -184,8 +184,9 @@ export function summarizeReadings(
     txRate: median(values("txRate")),
     channel: connected.length ? last.channel : null,
     band: connected.length ? last.band : null,
-    ssid: last.ssid,
-    bssid: last.bssid,
+    // A later redacted frame must not erase the identity already verified above.
+    ssid: unique.find((r) => r.ssid !== null)?.ssid ?? null,
+    bssid: unique.find((r) => r.bssid !== null)?.bssid ?? null,
     count: unique.length,
     min: signals.length ? Math.min(...signals) : null,
     max: signals.length ? Math.max(...signals) : null,

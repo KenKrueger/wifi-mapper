@@ -73,22 +73,60 @@ test("capture uses median, filters stale/invalid values, and deduplicates stream
   );
 });
 
+test("capture retains known network identifiers when the first or last samples are redacted", () => {
+  for (const knownAt of [0, 3]) {
+    const samples = Array.from({ length: 4 }, (_, index) =>
+      reading((3 - index) * 1_000, {
+        ssid: index === knownAt ? "Home" : null,
+        bssid: index === knownAt ? "aa:bb:cc:dd:ee:ff" : null,
+      }),
+    );
+    const measurement = summarizeReadings(samples, { x: 0, y: 0 }, "", now);
+    assert.equal(measurement.ssid, "Home");
+    assert.equal(measurement.bssid, "aa:bb:cc:dd:ee:ff");
+    assert.deepEqual(measurement.readings, samples);
+    assert.equal(measurement.timestamp, reading().timestamp);
+    const survey = { ...createSurvey(), measurements: [measurement] };
+    assert.deepEqual(validateSurvey(JSON.parse(JSON.stringify(survey))), survey);
+  }
+
+  const fullyRedacted = summarizeReadings(
+    [reading(0, { ssid: null, bssid: null })],
+    { x: 0, y: 0 },
+    "",
+    now,
+  );
+  assert.equal(fullyRedacted.ssid, null);
+  assert.equal(fullyRedacted.bssid, null);
+});
+
 test("network changes are rejected even through redacted readings", () => {
   const changed = reading(0, { bssid: "bb:bb:cc:dd:ee:ff" });
   assert.ok(!canCombineReadings(reading(), changed));
   assert.ok(
     canCombineReadings(reading(), reading(0, { ssid: null, bssid: null })),
   );
-  assert.throws(
-    () =>
-      summarizeReadings(
-        [reading(2_000), reading(1_000, { bssid: null }), changed],
-        { x: 0, y: 0 },
-        "",
-        now,
-      ),
-    /connection changed/,
-  );
+  for (const [key, value] of [
+    ["interface", "en1"],
+    ["ssid", "Hotspot"],
+    ["bssid", "bb:bb:cc:dd:ee:ff"],
+  ] as const) {
+    assert.throws(
+      () =>
+        summarizeReadings(
+          [
+            reading(3_000),
+            reading(2_000, { interface: null, ssid: null, bssid: null }),
+            reading(1_000, { [key]: value }),
+            reading(0, { interface: null, ssid: null, bssid: null }),
+          ],
+          { x: 0, y: 0 },
+          "",
+          now,
+        ),
+      /connection changed/,
+    );
+  }
 });
 
 test("disconnects remain null and service failures are not dead spots", () => {

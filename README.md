@@ -28,7 +28,11 @@ Then open <http://127.0.0.1:4318>. For development, use `npm run dev` instead of
 
 Surveys save automatically in this browser's local storage. Switch between floors using the tabs above the map; each floor has its own measurements, heat map, and router marker. Adding a survey keeps existing floors. Use **Reuse this floor plan** to compare another router setup without erasing an earlier survey.
 
+If another tab saves a newer collection, this tab stops saving and keeps your pending changes available for export. Use **Export this tab** before **Load saved floors** to keep both versions. A current browser is required for coordinated saving, and leaving with unsaved changes triggers a browser warning.
+
 Export **This floor** as JSON for one survey, **All floors backup** for the complete collection, **CSV** for measurement analysis, or **PNG** to share the current map. JSON backups include the floor-plan image and can be restored on another browser. Clearing browser data or switching browser profiles will remove or hide saved surveys; keep a backup before doing that. Exported files may include your Wi-Fi network name and access-point identifier when macOS makes them available.
+
+All-floor backups can exceed 8 MB and still be restored. They remain subject to the survey format's limits on floors, images, and measurements. Large imports may exceed browser storage; keep the backup file until the app confirms it has saved the restored collection.
 
 ## Optional local floor plans
 
