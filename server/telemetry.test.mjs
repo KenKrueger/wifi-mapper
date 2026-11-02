@@ -19,6 +19,45 @@ const reading = {
   band: "5 GHz",
 };
 
+// HTTP chunks can split or combine SSE frames, including UTF-8 characters.
+async function* readingEvents(body) {
+  const decoder = new TextDecoder();
+  let pending = "";
+  for await (const chunk of body) {
+    pending += decoder.decode(chunk, { stream: true });
+    let end;
+    while ((end = pending.indexOf("\n\n")) !== -1) {
+      const lines = pending.slice(0, end).split("\n");
+      pending = pending.slice(end + 2);
+      if (!lines.includes("event: reading")) continue;
+      const data = lines.filter((line) => line.startsWith("data:"))
+        .map((line) => line.slice(5).trimStart()).join("\n");
+      yield JSON.parse(data);
+    }
+  }
+}
+
+test("SSE assertions read complete events across split and combined chunks", async () => {
+  const first = { ...reading, message: "Signal café" };
+  const second = { ...reading, rssi: -80 };
+  const encode = (data) => `event: reading\ndata: ${JSON.stringify(data)}\n\n`;
+  const prefix = new TextEncoder().encode("retry: 2000\n\n: keepalive\n\n");
+  const frames = new TextEncoder().encode(encode(first) + encode(second));
+  for (const chunks of [
+    [prefix, frames],
+    [...prefix, ...frames].map((byte) => Uint8Array.of(byte)),
+    [new Uint8Array([...prefix, ...frames])],
+  ]) {
+    const stream = new ReadableStream({ start(controller) {
+      for (const chunk of chunks) controller.enqueue(chunk);
+      controller.close();
+    } });
+    const events = [];
+    for await (const event of readingEvents(stream)) events.push(event);
+    assert.deepEqual(events, [first, second]);
+  }
+});
+
 test("real RSSI remains available with redacted identity; SNR comes from the radio values", () => {
   const normalized = normalizeReading(reading, now);
   assert.equal(normalized.status, "connected");
@@ -114,6 +153,7 @@ test("HTTP API returns real frames, SSE updates, rejects writes and unknown API 
   await new Promise((resolve) => app.server.listen(0, "127.0.0.1", resolve));
   const url = `http://127.0.0.1:${app.server.address().port}`;
   const controller = new AbortController();
+  let events;
   try {
     const response = await fetch(`${url}/api/status`);
     assert.equal(response.status, 200);
@@ -135,21 +175,18 @@ test("HTTP API returns real frames, SSE updates, rejects writes and unknown API 
       403,
     );
     const stream = await fetch(`${url}/api/stream`, {
-      signal: controller.signal,
+      signal: AbortSignal.any([controller.signal, AbortSignal.timeout(5_000)]),
     });
     assert.equal(
       stream.headers.get("content-type"),
       "text/event-stream; charset=utf-8",
     );
-    const reader = stream.body.getReader();
-    const first = new TextDecoder().decode((await reader.read()).value);
-    assert.match(first, /event: reading/);
-    assert.match(first, /"rssi":-72/);
+    events = readingEvents(stream.body);
+    assert.deepEqual((await events.next()).value, reading);
     telemetry.emit("reading", { ...reading, rssi: -80 });
-    const next = new TextDecoder().decode((await reader.read()).value);
-    assert.match(next, /"rssi":-80/);
-    controller.abort();
+    assert.deepEqual((await events.next()).value, { ...reading, rssi: -80 });
   } finally {
+    await events?.return().catch(() => {});
     controller.abort();
     await app.close();
   }
