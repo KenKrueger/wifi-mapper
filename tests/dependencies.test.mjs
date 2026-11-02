@@ -20,6 +20,7 @@ if(command==='ls') {
   try {
     const lock=JSON.parse(fs.readFileSync(file('package-lock.json')));
     for(const [name,entry] of Object.entries(lock.packages)) {
+      if(entry.optional && !fs.existsSync(file(name+'/package.json'))) continue;
       if(name && JSON.parse(fs.readFileSync(file(name+'/package.json'))).version!==entry.version) process.exit(1);
     }
     process.exit(0);
@@ -32,13 +33,19 @@ if(fs.existsSync(file('interrupt-install'))) {
 }
 const lock=JSON.parse(fs.readFileSync(file('package-lock.json')));
 for(const [name,entry] of Object.entries(lock.packages)) {
+  if(entry.optional && fs.existsSync(file('omit-bindings'))) continue;
   if(name) write(name+'/package.json',JSON.stringify(entry));
 }
 const installed={packages:Object.fromEntries(Object.entries(lock.packages).filter(([name])=>name))};
 write('node_modules/.package-lock.json',JSON.stringify(installed));
 for(const name of ['tsc','vite']) {
-  write('node_modules/.bin/'+name,'#!/bin/sh\\nexit 0\\n');
+  write('node_modules/.bin/'+name,${JSON.stringify(`#!${process.execPath}\nimport '@typescript/native-test';\n`)});
   fs.chmodSync(file('node_modules/.bin/'+name),0o755);
+}
+write('node_modules/vite/index.js',"import '@rolldown/binding-test';\\n");
+if(!fs.existsSync(file('omit-bindings'))) {
+  write('node_modules/@rolldown/binding-test/index.js','export {};\\n');
+  write('node_modules/@typescript/native-test/index.js','export {};\\n');
 }
 `;
 
@@ -53,8 +60,10 @@ async function fixture(t) {
     devDependencies: { vite: "^1.0.0", typescript: "^1.0.0" } };
   const lock = { lockfileVersion: 3, packages: {
     "": manifest,
-    "node_modules/vite": { version: "1.0.0", integrity: "fixture-vite" },
+    "node_modules/vite": { version: "1.0.0", integrity: "fixture-vite", type: "module", main: "index.js" },
     "node_modules/typescript": { version: "1.0.0", integrity: "fixture-ts" },
+    "node_modules/@rolldown/binding-test": { version: "1.0.0", optional: true, type: "module", main: "index.js" },
+    "node_modules/@typescript/native-test": { version: "1.0.0", optional: true, type: "module", main: "index.js" },
   } };
   await writeFile(path.join(directory, "package.json"), JSON.stringify(manifest));
   await writeFile(path.join(directory, "package-lock.json"), JSON.stringify(lock));
@@ -81,7 +90,7 @@ test("launcher dependency setup retries an interrupted install and then works of
   assert.equal(f.run().status, 0);
   assert.equal(f.run().status, 0);
   assert.deepEqual(await f.calls(), [
-    "ci --include=dev", "ci --include=dev", "ls --all --include=dev --offline",
+    "ci --include=dev --include=optional", "ci --include=dev --include=optional", "ls --all --include=dev --offline",
     "ls --all --include=dev --offline",
   ]);
 });
@@ -118,5 +127,32 @@ test("an interrupted repair cannot retain a success marker", async (t) => {
   assert.equal(f.run().status, 1);
   await assert.rejects(access(path.join(f.directory, "node_modules/.fieldnote-install")));
   await rm(path.join(f.directory, "interrupt-install"));
+  assert.equal(f.run().status, 0);
+});
+
+test("missing optional toolchain bindings trigger repair even when npm ls passes", async (t) => {
+  const f = await fixture(t);
+  assert.equal(f.run().status, 0);
+  for (const name of ["@rolldown/binding-test", "@typescript/native-test"]) {
+    await rm(path.join(f.directory, "node_modules", name), { recursive: true });
+    const listing = spawnSync(path.join(f.directory, "bin/npm"), ["ls", "--all", "--include=dev", "--offline"], {
+      cwd: f.directory, encoding: "utf8",
+    });
+    assert.equal(listing.status, 0, "npm ls alone accepts the missing optional binding");
+    const repaired = f.run();
+    assert.equal(repaired.status, 0, repaired.stderr);
+    await access(path.join(f.directory, "node_modules", name, "index.js"));
+  }
+  assert.equal((await f.calls()).filter((line) => line.startsWith("ci ")).length, 3);
+});
+
+test("installation success without required bindings cannot write a success marker", async (t) => {
+  const f = await fixture(t);
+  await writeFile(path.join(f.directory, "omit-bindings"), "");
+  const failed = f.run();
+  assert.equal(failed.status, 1);
+  assert.match(failed.stderr, /installation is incomplete/);
+  await assert.rejects(access(path.join(f.directory, "node_modules/.fieldnote-install")));
+  await rm(path.join(f.directory, "omit-bindings"));
   assert.equal(f.run().status, 0);
 });

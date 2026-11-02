@@ -21,16 +21,19 @@ async function fingerprint(directory) {
   return { hash, lock };
 }
 
-function npm(directory, args, quiet = false) {
+function run(directory, command, args, quiet = false, timeout = 0) {
   return new Promise((resolve, reject) => {
-    const child = spawn("npm", args, {
+    const child = spawn(command, args, {
       cwd: directory,
       stdio: quiet ? "ignore" : "inherit",
+      timeout,
     });
     child.once("error", reject);
     child.once("exit", (code) => resolve(code === 0));
   });
 }
+
+const npm = (directory, args, quiet = false) => run(directory, "npm", args, quiet);
 
 async function healthy(directory) {
   // npm ls is local/offline and catches incomplete transitive dependency trees.
@@ -39,7 +42,16 @@ async function healthy(directory) {
   );
   if (!(await Promise.allSettled(bins)).every((result) => result.status === "fulfilled"))
     return false;
-  return npm(directory, ["ls", "--all", "--include=dev", "--offline"], true);
+  if (!await npm(directory, ["ls", "--all", "--include=dev", "--offline"], true))
+    return false;
+  // npm ls tolerates missing optional packages, but the current platform's
+  // Vite/Rolldown and TypeScript bindings are required to build this app.
+  // Load/execute the actual installed tools without starting a server or build.
+  const smoke = await Promise.all([
+    run(directory, process.execPath, ["--input-type=module", "-e", "await import('vite')"], true, 15_000),
+    run(directory, process.execPath, [path.join(directory, "node_modules", ".bin", "tsc"), "--version"], true, 15_000),
+  ]);
+  return smoke.every(Boolean);
 }
 
 async function installedLockMatches(directory, lockText) {
@@ -75,7 +87,7 @@ export async function ensureDependencies(directory = root) {
   // Never leave a success marker behind after an interrupted/failed attempt.
   await rm(marker, { force: true });
   console.log("Installing Fieldnote dependencies…");
-  if (!await npm(directory, [current.lock ? "ci" : "install", "--include=dev"]))
+  if (!await npm(directory, [current.lock ? "ci" : "install", "--include=dev", "--include=optional"]))
     throw new Error("Dependency installation failed. Check your internet connection and try again.");
   if (!await healthy(directory))
     throw new Error("Dependency installation is incomplete. Try launching Fieldnote again.");
